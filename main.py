@@ -51,7 +51,7 @@ db.commit()
 
 intents = discord.Intents.default()
 intents.members = True
-intents.presences = True
+# intents.presences = True
 
 
 bot = commands.Bot(
@@ -599,11 +599,11 @@ async def on_ready():
     )
 
 
-    if status_task is None:
-
-        status_task = asyncio.create_task(
-            update_status()
-        )
+# if status_task is None:
+#
+#     status_task = asyncio.create_task(
+#         update_status()
+#     )
 
 
     print(
