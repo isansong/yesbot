@@ -2,6 +2,7 @@ import os
 import sqlite3
 import asyncio
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -11,6 +12,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
+def kst_now():
+    return datetime.now(ZoneInfo("Asia/Seoul"))
+
+def get_time_log():
+    server = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    kst = kst_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return (
+        f"🖥️ Server : {server}\n"
+        f"🇰🇷 KST : {kst}"
+    )
 
 
 # ==========================
@@ -166,7 +178,7 @@ class VerifyModal(discord.ui.Modal, title="서버 인증"):
                 user_id,
                 number,
                 roblox,
-                datetime.now().strftime(
+                kst_now().strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
             )
@@ -215,9 +227,8 @@ class VerifyModal(discord.ui.Modal, title="서버 인증"):
 
             embed.add_field(
                 name="시간",
-                value=datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
+                value=get_time_log(),
+                inline=False
             )
 
 
@@ -785,7 +796,7 @@ async def manual_verify(
             user_id,
             number,
             roblox,
-            datetime.now().strftime(
+            kst_now().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
         )
@@ -1073,10 +1084,10 @@ async def verify_delete(
 
         embed.add_field(
             name="시간",
-            value=datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            value=get_time_log(),
+            inline=False
         )
+        
 
 
         await log.send(
