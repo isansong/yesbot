@@ -1,5 +1,7 @@
 import os
 import json
+import base64
+import io
 import sqlite3
 import asyncio
 import threading
@@ -53,6 +55,11 @@ AI_QA_CHANNEL_ID = int(os.getenv("AI_QA_CHANNEL_ID", "0"))
 AI_QA_ENABLED = bool(GEMINI_ENABLED and AI_QA_CHANNEL_ID)
 AI_QA_MAX_LENGTH = 1000
 SERVER_INFO_DB = "server_info.json"
+
+# Nano Banana 이미지 생성
+NANO_BANANA_MODEL = os.getenv("NANO_BANANA_MODEL", "gemini-3.1-flash-image")
+NANO_BANANA_ENABLED = bool(GEMINI_API_KEY and genai)
+NANO_BANANA_MAX_PROMPT = 1800
 # 동시에 너무 많은 Gemini 요청이 나가지 않도록 제한
 gemini_semaphore = asyncio.Semaphore(3)
 
@@ -809,6 +816,9 @@ async def on_ready():
             f"💬 Gemini 자동 문의: {'ON' if AI_QA_ENABLED else 'OFF'}"
             + (f" | 채널 ID: {AI_QA_CHANNEL_ID}" if AI_QA_ENABLED else "")
         )
+        print(
+            f"🍌 Nano Banana 이미지: {'ON' if NANO_BANANA_ENABLED else 'OFF'} | 모델: {NANO_BANANA_MODEL}"
+        )
         if not GEMINI_ENABLED:
             if genai is None:
                 print("⚠️ google-genai 패키지가 없습니다. 설치: python -m pip install -U google-genai")
@@ -994,6 +1004,90 @@ async def server_info_view(interaction: discord.Interaction):
 
 
 # =========================
+# Nano Banana 이미지 생성
+# =========================
+@bot.tree.command(
+    name="그림",
+    description="Nano Banana로 이미지를 생성합니다.",
+    guild=GUILD,
+)
+async def generate_image(interaction: discord.Interaction, 프롬프트: str):
+    if not NANO_BANANA_ENABLED:
+        await interaction.response.send_message(
+            "❌ Nano Banana가 연결되어 있지 않습니다.",
+            ephemeral=True,
+        )
+        return
+
+    prompt = 프롬프트.strip()
+    if not prompt:
+        await interaction.response.send_message(
+            "❌ 그림 설명을 입력해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    if len(prompt) > NANO_BANANA_MAX_PROMPT:
+        await interaction.response.send_message(
+            f"❌ 프롬프트는 {NANO_BANANA_MAX_PROMPT}자 이하로 입력해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+    print(f"🍌 Nano Banana 이미지 생성 요청: {prompt[:100]!r}")
+
+    try:
+        async with gemini_semaphore:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    gemini_client.interactions.create,
+                    model=NANO_BANANA_MODEL,
+                    input=prompt,
+                    response_format={
+                        "type": "image",
+                        "mime_type": "image/png",
+                        "aspect_ratio": "1:1",
+                        "image_size": "1K",
+                    },
+                ),
+                timeout=90,
+            )
+
+        output_image = getattr(result, "output_image", None)
+        image_data = getattr(output_image, "data", None) if output_image else None
+
+        if not image_data:
+            await interaction.followup.send(
+                "❌ 이미지 생성 결과를 받지 못했습니다. 잠시 후 다시 시도해주세요."
+            )
+            return
+
+        image_bytes = base64.b64decode(image_data)
+        file = discord.File(
+            io.BytesIO(image_bytes),
+            filename="nano_banana.png",
+        )
+
+        embed = discord.Embed(
+            title="🍌 Nano Banana 이미지",
+            description=f"**프롬프트:** {prompt[:1000]}",
+            color=0x5865F2,
+        )
+        embed.set_image(url="attachment://nano_banana.png")
+        embed.set_footer(text=f"모델: {NANO_BANANA_MODEL}")
+
+        await interaction.followup.send(embed=embed, file=file)
+        print("🍌 Nano Banana 이미지 생성 완료")
+
+    except Exception as e:
+        print(f"❌ Nano Banana 이미지 생성 오류: {type(e).__name__}: {e}")
+        await interaction.followup.send(
+            "❌ 이미지 생성에 실패했습니다. 잠시 후 다시 시도해주세요."
+        )
+
+
+# =========================
 # 날씨
 # =========================
 WEATHER_CODES = {
@@ -1088,4 +1182,5 @@ def start_api():
 
 threading.Thread(target=start_api, daemon=True).start()
 bot.run(TOKEN)
+
 
