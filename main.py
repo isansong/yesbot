@@ -1046,7 +1046,7 @@ async def generate_image(interaction: discord.Interaction, 프롬프트: str):
                     input=prompt,
                     response_format={
                         "type": "image",
-                        "mime_type": "image/png",
+                        "mime_type": "image/jpeg",
                         "aspect_ratio": "1:1",
                         "image_size": "1K",
                     },
@@ -1066,7 +1066,7 @@ async def generate_image(interaction: discord.Interaction, 프롬프트: str):
         image_bytes = base64.b64decode(image_data)
         file = discord.File(
             io.BytesIO(image_bytes),
-            filename="nano_banana.png",
+            filename="nano_banana.jpg",
         )
 
         embed = discord.Embed(
@@ -1074,16 +1074,20 @@ async def generate_image(interaction: discord.Interaction, 프롬프트: str):
             description=f"**프롬프트:** {prompt[:1000]}",
             color=0x5865F2,
         )
-        embed.set_image(url="attachment://nano_banana.png")
+        embed.set_image(url="attachment://nano_banana.jpg")
         embed.set_footer(text=f"모델: {NANO_BANANA_MODEL}")
 
         await interaction.followup.send(embed=embed, file=file)
         print("🍌 Nano Banana 이미지 생성 완료")
 
     except Exception as e:
-        print(f"❌ Nano Banana 이미지 생성 오류: {type(e).__name__}: {e}")
+        print(
+            f"❌ Nano Banana 이미지 생성 오류: "
+            f"{type(e).__name__}: {e}"
+        )
         await interaction.followup.send(
-            "❌ 이미지 생성에 실패했습니다. 잠시 후 다시 시도해주세요."
+            "❌ 이미지 생성에 실패했습니다. "
+            "콘솔의 `Nano Banana 이미지 생성 오류` 로그를 확인해주세요."
         )
 
 
@@ -1178,6 +1182,10 @@ def start_api():
         uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
     except OSError as e:
         print(f"FastAPI 시작 실패 (포트 {PORT}): {e}")
+
+
+threading.Thread(target=start_api, daemon=True).start()
+bot.run(TOKEN)
 
 
 threading.Thread(target=start_api, daemon=True).start()
