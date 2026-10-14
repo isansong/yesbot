@@ -950,9 +950,10 @@ async def weather(interaction: discord.Interaction, 지역: str):
 # =========================
 def start_api():
     try:
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
-    except OSError as e:
-        print(f"FastAPI 시작 실패 (포트 {PORT}): {e}")
+        print(f"[API] 서버 시작 시도: 포트 {PORT}", flush=True)
+        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    except Exception as e:
+        print(f"[API] 서버 시작 실패: {type(e).__name__}: {e}", flush=True)
 
 
 if __name__ == "__main__":
