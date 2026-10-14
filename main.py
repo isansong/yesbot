@@ -1,32 +1,23 @@
-import os
-import json
-import base64
-import io
-import sqlite3
 import asyncio
-import threading
-import urllib.parse
-import urllib.request
-import urllib.error
+import io
+import json
+import os
 import re
-import unicodedata
-import random
-from collections import OrderedDict
+import sqlite3
+import threading
+from collections import Counter, OrderedDict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
+import uvicorn
 from discord.ext import commands
 from dotenv import load_dotenv
-import uvicorn
-from api import app
-
-try:
-    from google import genai
-except ImportError:
-    genai = None
 
 load_dotenv()
+
+from api import app, discard_code, get_pending  # noqa: E402  (load_dotenv 이후에 불러온다)
 
 # =========================
 # 설정
@@ -34,58 +25,43 @@ load_dotenv()
 TOKEN = os.getenv("TOKEN")
 PORT = int(os.getenv("PORT", "8000"))
 JSON_DB = "database.json"
+KST = ZoneInfo("Asia/Seoul")
+
 GUILD_ID = 848855044655808542
 ROLE_ID = 1534137711798124614
 LOG_CHANNEL_ID = 1534147708124925962
 STATUS_CHANNEL_ID = 1534151355558793216
 
-# =========================
-# 채팅 관리
-# =========================
-MOD_LOG_CHANNEL_ID = LOG_CHANNEL_ID
-PROFANITY_FILTER_ENABLED = True
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_ENABLED = bool(GEMINI_API_KEY and genai)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_ENABLED else None
-
-# Gemini 자동 문의 설정
-# .env에 AI_QA_CHANNEL_ID=문의채널ID 를 넣으면 해당 채널에서만 자동 답변한다.
-AI_QA_CHANNEL_ID = int(os.getenv("AI_QA_CHANNEL_ID", "0"))
-AI_QA_ENABLED = bool(GEMINI_ENABLED and AI_QA_CHANNEL_ID)
-AI_QA_MAX_LENGTH = 1000
-SERVER_INFO_DB = "server_info.json"
-
-# Nano Banana 이미지 생성
-NANO_BANANA_MODEL = os.getenv("NANO_BANANA_MODEL", "gemini-3.1-flash-image")
-NANO_BANANA_ENABLED = bool(GEMINI_API_KEY and genai)
-NANO_BANANA_MAX_PROMPT = 1800
-# 동시에 너무 많은 Gemini 요청이 나가지 않도록 제한
-gemini_semaphore = asyncio.Semaphore(3)
-
+# 티켓 시스템 (.env에서 선택적으로 변경 가능)
+TICKET_LOG_CHANNEL_ID = int(os.getenv("TICKET_LOG_CHANNEL_ID", str(LOG_CHANNEL_ID)))
+TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))
+TICKET_STAFF_ROLE_ID = int(os.getenv("TICKET_STAFF_ROLE_ID", "0"))
 
 GUILD = discord.Object(id=GUILD_ID)
 
 if not TOKEN:
     raise RuntimeError(".env에 TOKEN이 없습니다.")
 
+
 # =========================
 # DB
 # =========================
 db = sqlite3.connect("users.db")
-db.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    discord_id TEXT PRIMARY KEY,
-    number TEXT UNIQUE,
-    roblox TEXT,
-    created TEXT
+db.execute(
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        discord_id TEXT PRIMARY KEY,
+        number TEXT UNIQUE,
+        roblox TEXT,
+        created TEXT
+    )
+    """
 )
-""")
 db.commit()
 
 
 def now():
-    return datetime.now(ZoneInfo("Asia/Seoul"))
+    return datetime.now(KST)
 
 
 def db_get(discord_id):
@@ -95,37 +71,59 @@ def db_get(discord_id):
 
 
 def db_get_number(number):
+    return db.execute("SELECT * FROM users WHERE number=?", (number,)).fetchone()
+
+
+def db_get_roblox(roblox):
     return db.execute(
-        "SELECT * FROM users WHERE number=?", (number,)
+        "SELECT * FROM users WHERE lower(roblox)=lower(?)", (roblox,)
     ).fetchone()
 
 
-def save_json(discord_id, number, roblox):
-    data = {}
+def next_serial():
+    """고유번호를 1부터 순서대로 배정한다. (현재 가장 큰 번호 + 1)"""
+    row = db.execute("SELECT MAX(CAST(number AS INTEGER)) FROM users").fetchone()
+    return str((row[0] or 0) + 1)
+
+
+def _read_json():
     try:
         with open(JSON_DB, encoding="utf-8") as f:
             data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+        return {}
 
-    data[str(discord_id)] = {"serial": number, "roblox": roblox}
-    with open(JSON_DB, "w", encoding="utf-8") as f:
+
+def _write_json(data):
+    # 임시 파일에 쓴 뒤 교체해서, API가 쓰다 만 파일을 읽는 일을 막는다.
+    tmp = f"{JSON_DB}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
+    os.replace(tmp, JSON_DB)
+
+
+def save_json(discord_id, number, roblox):
+    data = _read_json()
+    data[str(discord_id)] = {"serial": number, "roblox": roblox}
+    _write_json(data)
 
 
 def delete_json(discord_id):
-    data = {}
-    try:
-        with open(JSON_DB, encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
-
+    data = _read_json()
     data.pop(str(discord_id), None)
-    with open(JSON_DB, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    _write_json(data)
 
 
+def delete_user(discord_id):
+    db.execute("DELETE FROM users WHERE discord_id=?", (str(discord_id),))
+    db.commit()
+    delete_json(discord_id)
+
+
+# =========================
+# 공용 헬퍼
+# =========================
 def log_time():
     return (
         f"🖥️ Server : {datetime.now():%Y-%m-%d %H:%M:%S}\n"
@@ -133,12 +131,8 @@ def log_time():
     )
 
 
-def is_admin(interaction):
-    return interaction.user.guild_permissions.administrator
-
-
 async def deny_non_admin(interaction):
-    if not is_admin(interaction):
+    if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
             "❌ 관리자만 사용할 수 있습니다.", ephemeral=True
         )
@@ -155,16 +149,33 @@ async def send_log(title, fields, color=0x5865F2, with_time=False):
         embed.add_field(name=name, value=value, inline=inline)
     if with_time:
         embed.add_field(name="시간", value=log_time(), inline=False)
-    await channel.send(embed=embed)
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"로그 전송 실패: {e}")
+
+
+def auth_info_embed(member, data):
+    embed = discord.Embed(title="🔎 인증 정보", color=0x3498DB)
+    embed.add_field(name="유저", value=member.mention, inline=False)
+    embed.add_field(name="고유번호", value=data[1])
+    embed.add_field(name="로블록스", value=data[2])
+    embed.add_field(name="인증일", value=data[3], inline=False)
+    return embed
 
 
 async def apply_auth(member, number, roblox):
-    """닉네임/역할 적용. 실패하면 (False, 메시지)를 반환."""
+    """닉네임/역할 적용.
+
+    닉네임은 바꿀 수 있는 유저만 바꾸고, 못 바꾸는 유저(서버장, 봇보다 높은 역할)는
+    그대로 둔다. 역할 지급에 실패하면 (False, 메시지)를 반환하고,
+    성공하면 (True, 바뀐 닉네임 또는 None)을 반환한다.
+    """
     nickname = f"{number} · {roblox} · 주민"
     try:
         await member.edit(nick=nickname)
     except discord.Forbidden:
-        return False, "❌ 닉네임 변경 실패\n봇 역할 위치와 권한을 확인해주세요."
+        nickname = None  # 서버장 등은 봇이 닉네임을 바꿀 수 없으니 건너뛴다.
 
     role = member.guild.get_role(ROLE_ID)
     if role is None:
@@ -191,366 +202,48 @@ async def remove_auth(member):
         pass
 
 
+async def register_member(member, number, roblox):
+    """중복 확인 → 닉네임/역할 적용 → DB 저장. (성공 여부, 메시지)를 반환."""
+    if db_get(member.id):
+        return False, "❌ 이미 인증된 계정입니다."
+    if db_get_number(number):
+        return False, "❌ 이미 사용 중인 고유번호입니다."
+
+    ok, result = await apply_auth(member, number, roblox)
+    if not ok:
+        return False, result
+
+    db.execute(
+        "INSERT INTO users(discord_id, number, roblox, created) VALUES (?, ?, ?, ?)",
+        (str(member.id), number, roblox, now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    db.commit()
+    save_json(member.id, number, roblox)
+    return True, result
+
+
 # =========================
-# 메시지 관리 / 검열
+# 삭제된 메시지 로그
 # =========================
-MOD_LOG_CHANNEL_ID = LOG_CHANNEL_ID
-PROFANITY_FILTER_ENABLED = True
-
-# 확실한 욕설/초성은 로컬에서 즉시 삭제.
-LOCAL_PROFANITY = {
-    "씨발", "시발", "씨발놈", "시발놈", "ㅅㅂ", "ㅆㅂ", "ㅆ발",
-    "병신", "븅신", "ㅂㅅ", "개병신", "병신새끼",
-    "개새끼", "ㅅㄲ", "좆", "존나", "졸라",
-    "지랄", "ㅈㄹ", "꺼져", "닥쳐", "ㄲㅈ",
-    "느금마", "느금마새끼", "느금마년", "니엄마", "니애미",
-    "니미", "애미없다", "애미없네", "애비없다", "애비없네",
-    "엄마없다", "엄마없네", "아빠없다", "아빠없네",
-    "fuck", "fucking", "shit", "bitch", "asshole", "stfu",
-}
-
-# 정상 단어 오탐을 줄이면서 문맥이 필요한 메시지를 Gemini로 보낸다.
-GEMINI_HINTS = {
-    "새끼", "좆", "존나", "졸라", "니미", "애미", "애비",
-    "엄마없", "아빠없", "느금", "ㅅㄲ", "ㄴㄱㅁ",
-    "ㅂㅅ", "ㅅㅂ", "ㅆㅂ", "ㅈㄹ", "ㄲㅈ",
-    "fuck", "shit", "bitch", "asshole",
-    "성희롱", "음란", "성적", "야한", "신체",
-    "가슴", "엉덩이", "성기",
-    "자지", "보지", "꼬추",
-}
-
-CHO_PROFANITY = (
-    "ㅆㅂ", "ㅅㅂ", "ㅂㅅ", "ㅈㄹ", "ㅅㄲ", "ㄴㄱㅁ", "ㄲㅈ",
-)
-
 MESSAGE_CACHE = OrderedDict()
 MESSAGE_CACHE_LIMIT = 2000
-BOT_DELETED_MESSAGES = set()
-
-
-def normalize_message(text):
-    return unicodedata.normalize("NFKC", text).lower()
-
-
-def compact_message(text):
-    return re.sub(
-        r"[^0-9a-z가-힣ㄱ-ㅎㅏ-ㅣ]",
-        "",
-        normalize_message(text),
-    )
-
-
-def find_local_profanity(text):
-    normalized = normalize_message(text)
-    compact = compact_message(text)
-
-    # 초성 우회: 공백/기호 제거 후 검사
-    for word in CHO_PROFANITY:
-        if word in compact:
-            return word
-
-    for word in LOCAL_PROFANITY:
-        w = normalize_message(word)
-
-        # 영어는 단어 경계 기준
-        if re.fullmatch(r"[a-z]+", w):
-            if re.search(rf"(?<![a-z]){re.escape(w)}(?![a-z])", normalized):
-                return word
-            continue
-
-        # 정상 단어 내부 오탐 방지
-        # 예: 시발점 / 새끼손가락
-        if re.search(rf"(?<![가-힣]){re.escape(w)}(?![가-힣])", compact):
-            return word
-
-    return None
-
-
-def should_gemini_review(text):
-    compact = compact_message(text)
-    normalized = normalize_message(text)
-
-    # 명백한 문맥 신호가 있으면 Gemini 검토
-    if any(x in compact for x in GEMINI_HINTS):
-        return True
-
-    # 성적인 문맥은 띄어쓰기/표현 변화가 많아서 별도 신호 검사
-    sexual_signals = (
-        "성희롱", "음란", "성적", "야한", "야동",
-        "신체", "가슴", "엉덩이", "성기",
-        "자지", "보지", "꼬추",
-    )
-    if any(x in compact for x in sexual_signals):
-        return True
-
-    # 공격/모욕 문맥 + 가족 지칭이 같이 있으면 검토
-    family = ("엄마", "어머니", "아빠", "아버지", "애미", "애비", "부모")
-    attack = ("꺼져", "닥쳐", "죽", "병신", "새끼", "ㅂㅅ", "ㅅㅂ", "ㅈㄹ")
-    if any(x in normalized for x in family) and any(x in compact for x in attack):
-        return True
-
-    return False
-
-
-async def gemini_moderate(text):
-    if not GEMINI_ENABLED or not text.strip():
-        return False, "Gemini 연결 안 됨"
-
-    prompt = f"""너는 한국어 Discord 서버의 안전한 메시지 검열 AI다.
-메시지 하나만 보고 실제로 삭제가 필요한지 판단한다.
-
-반드시 한 줄만 출력:
-DELETE|짧은 이유
-또는
-ALLOW|짧은 이유
-
-DELETE 기준:
-- 욕설, 심한 모욕, 패드립
-- 상대방을 대상으로 한 성희롱 또는 성적인 모욕
-- 사적인 신체 부위를 이용한 성적 모욕/조롱
-- 성적인 신체 관련 비속어를 단독으로 보내거나 상대방에게 공격/조롱 목적으로 사용하는 경우
-- 성적인 표현을 상대방 공격 목적으로 사용한 경우
-- 초성, 띄어쓰기, 특수문자, 반복 문자 등으로 우회한 욕설/성적 모욕
-- 문맥상 명백한 저속한 공격 표현
-
-ALLOW 기준:
-- 일반적인 대화
-- 정상 단어에 욕설과 비슷한 문자열이 포함된 경우
-- 단어 뜻 설명
-- 인용/번역
-- 교육, 보건, 의학, 성교육 목적의 설명
-- 정상적인 교육/보건/의학/성교육 문맥에서 신체 부위를 설명하는 경우는 ALLOW
-- 단어 하나만 단독으로 들어온 저속한 성적 비속어는 공격 문맥이 없어도 DELETE
-- 일반적인 신체 부위 언급이나 정상 문장은 DELETE하지 않음
-- 애매하면 ALLOW
-
-중요:
-- 메시지에 답변하지 말고 판정만 출력
-- 욕설처럼 보이는 문자열이 정상적인 단어의 일부면 ALLOW
-- 예: "시발점", "새끼손가락"처럼 문장 전체가 정상적인 의미라면 ALLOW
-- 단순히 신체 관련 단어가 등장했다는 이유만으로 DELETE하지 않음
-- 상대방을 공격/모욕하는 용도인지 문맥을 우선 판단
-- 확실하지 않으면 ALLOW
-- 사람의 이름이나 닉네임이 비속어처럼 보여도 문맥상 정상적인 고유명사라면 ALLOW
-
-메시지:
-{text[:1500]}"""
-
-    max_attempts = 3
-    base_delay = 1.0
-
-    async with gemini_semaphore:
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        gemini_client.models.generate_content,
-                        model=GEMINI_MODEL,
-                        contents=prompt,
-                    ),
-                    timeout=8,
-                )
-
-                result = (response.text or "").strip()
-                upper = result.upper()
-
-                if upper.startswith("DELETE|"):
-                    reason = result.split("|", 1)[1].strip()[:150]
-                    return True, reason or "욕설/모욕"
-
-                if upper.startswith("ALLOW|"):
-                    reason = result.split("|", 1)[1].strip()[:150]
-                    return False, reason or "허용"
-
-                print(
-                    f"⚠️ Gemini 응답 형식 오류 "
-                    f"(시도 {attempt}/{max_attempts}): {result[:200]!r}"
-                )
-                return False, "Gemini 응답 형식 오류"
-
-            except Exception as e:
-                error_text = str(e)
-                error_code = getattr(e, "code", None)
-
-                # google-genai 예외는 버전에 따라 code가 없을 수 있으므로
-                # 예외 문자열에서도 HTTP 상태를 확인한다.
-                match = re.search(r"\b(408|429|500|502|503|504)\b", error_text)
-                status = str(error_code or (match.group(1) if match else ""))
-
-                transient = status in {"408", "429", "500", "502", "503", "504"}
-
-                if transient and attempt < max_attempts:
-                    delay = base_delay * (2 ** (attempt - 1))
-                    delay += random.uniform(0, 0.5)
-
-                    print(
-                        f"⚠️ Gemini 일시 오류: HTTP {status} "
-                        f"| 재시도 {attempt}/{max_attempts - 1} "
-                        f"| 약 {delay:.1f}초 후 재시도"
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-
-                if transient:
-                    print(
-                        f"❌ Gemini 재시도 실패: HTTP {status or 'UNKNOWN'} "
-                        f"| {max_attempts}회 시도 완료"
-                    )
-                    return False, (
-                        f"Gemini 일시 오류(HTTP {status or 'UNKNOWN'}) "
-                        f"- {max_attempts}회 재시도 실패"
-                    )
-
-                print(
-                    f"❌ Gemini 검열 오류: {type(e).__name__}: {error_text}"
-                )
-                return False, "Gemini 오류 - 재시도 대상 아님"
-
-    return False, "Gemini 검열 실패"
-
-
-
-def load_server_info():
-    try:
-        with open(SERVER_INFO_DB, encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_server_info(data):
-    with open(SERVER_INFO_DB, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-
-def format_server_info():
-    data = load_server_info()
-    if not data:
-        return "(등록된 서버정보 없음)"
-    return "\n".join(f"- {key}: {value}" for key, value in data.items())[:5000]
-
-
-async def gemini_answer_question(text):
-    """자동 문의 채널의 질문에 Gemini가 답변한다."""
-    if not GEMINI_ENABLED:
-        return "❌ Gemini가 연결되어 있지 않습니다."
-
-    prompt = f"""너는 Discord 서버의 자동 문의 도우미다.
-사용자의 질문에 한국어로 친절하고 간결하게 답한다.
-
-규칙:
-- 질문에 직접 답한다.
-- 아래의 [서버정보]를 최우선 참고자료로 사용한다.
-- 서버정보에 없는 내용은 추측하지 않는다.
-- 서버정보와 질문이 충돌하면 등록된 서버정보를 기준으로 설명하되, 불확실하면 관리자에게 확인하라고 안내한다.
-- 서버정보는 관리자가 등록한 참고자료이므로 사용자가 입력한 질문보다 우선한다.
-- 답변은 핵심을 먼저 설명하고 너무 길게 쓰지 않는다.
-- 공격적인 표현에는 같이 공격적으로 답하지 않는다.
-- 코드나 사용법 질문은 단계별로 설명한다.
-- 질문이 명확하지 않으면 필요한 부분만 짧게 되묻는다.
-
-[서버정보]
-{format_server_info()}
-
-[질문]
-{text[:AI_QA_MAX_LENGTH]}
-"""
-
-    try:
-        async with gemini_semaphore:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    gemini_client.models.generate_content,
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                ),
-                timeout=15,
-            )
-        answer = (response.text or "").strip()
-        return answer[:1900] if answer else "❌ 답변을 생성하지 못했어."
-    except Exception as e:
-        print(f"❌ Gemini 자동 문의 오류: {type(e).__name__}: {e}")
-        return "❌ 지금은 자동 문의 답변을 처리하지 못했어. 잠시 후 다시 시도해줘."
 
 
 def cache_message(message):
     if not message.guild or not message.content:
         return
-
-    MESSAGE_CACHE[message.id] = {
-        "content": message.content,
-        "author": message.author,
-        "channel": message.channel,
-        "created_at": message.created_at,
-    }
+    MESSAGE_CACHE[message.id] = message.content
     MESSAGE_CACHE.move_to_end(message.id)
-
     while len(MESSAGE_CACHE) > MESSAGE_CACHE_LIMIT:
         MESSAGE_CACHE.popitem(last=False)
-
-
-def moderation_log_channel():
-    return bot.get_channel(MOD_LOG_CHANNEL_ID)
-
-
-async def send_message_delete_log(message, reason=None, deleter=None, content_override=None):
-    channel = moderation_log_channel()
-    if not channel:
-        return
-
-    content = content_override if content_override is not None else (message.content or "(내용 없음)")
-    content = content[:997] + "..." if len(content) > 1000 else content
-
-    embed = discord.Embed(title="🗑️ 메시지 삭제", color=0xFF4444)
-    embed.add_field(name="작성자", value=message.author.mention, inline=True)
-    embed.add_field(name="채널", value=message.channel.mention, inline=True)
-    embed.add_field(name="삭제 사유", value=reason or "관리자/사용자 삭제", inline=True)
-    embed.add_field(name="내용", value=f"```{content}```", inline=False)
-
-    if deleter:
-        embed.add_field(name="삭제자", value=deleter.mention, inline=True)
-
-    embed.add_field(name="시간", value=log_time(), inline=False)
-
-    try:
-        await channel.send(embed=embed)
-    except discord.HTTPException as e:
-        print(f"메시지 삭제 로그 실패: {e}")
-
-
-async def send_filter_log(message, matched, ai_reason=""):
-    channel = moderation_log_channel()
-    if not channel:
-        return
-
-    embed = discord.Embed(title="🛡️ 욕설 메시지 자동 삭제", color=0xFFA500)
-    embed.add_field(name="작성자", value=message.author.mention, inline=True)
-    embed.add_field(name="채널", value=message.channel.mention, inline=True)
-    embed.add_field(name="감지 방식", value=f"`{matched}`", inline=True)
-
-    if ai_reason:
-        embed.add_field(name="AI 판단", value=ai_reason, inline=True)
-
-    content = (message.content or "(내용 없음)")[:1000]
-    embed.add_field(name="삭제된 내용", value=f"```{content}```", inline=False)
-    embed.add_field(name="시간", value=log_time(), inline=False)
-
-    try:
-        await channel.send(embed=embed)
-    except discord.HTTPException as e:
-        print(f"욕설 로그 실패: {e}")
 
 
 async def find_delete_actor(message):
     if not message.guild.me.guild_permissions.view_audit_log:
         return None
-
     try:
         async for entry in message.guild.audit_logs(
-            limit=5,
-            action=discord.AuditLogAction.message_delete,
+            limit=5, action=discord.AuditLogAction.message_delete
         ):
             if (
                 entry.target
@@ -560,8 +253,30 @@ async def find_delete_actor(message):
                 return entry.user
     except (discord.Forbidden, discord.HTTPException):
         pass
-
     return None
+
+
+async def send_message_delete_log(message, deleter, content):
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if not channel:
+        return
+
+    content = content or "(내용 없음)"
+    if len(content) > 1000:
+        content = content[:997] + "..."
+
+    embed = discord.Embed(title="🗑️ 메시지 삭제", color=0xFF4444)
+    embed.add_field(name="작성자", value=message.author.mention, inline=True)
+    embed.add_field(name="채널", value=message.channel.mention, inline=True)
+    embed.add_field(name="삭제자", value=deleter.mention if deleter else "알 수 없음", inline=True)
+    embed.add_field(name="내용", value=f"```{content}```", inline=False)
+    embed.add_field(name="시간", value=log_time(), inline=False)
+
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"메시지 삭제 로그 실패: {e}")
+
 
 # =========================
 # Discord
@@ -580,37 +295,53 @@ commands_synced = False
 # =========================
 # 인증 모달 / 버튼
 # =========================
+REGISTER_LOCK = asyncio.Lock()  # 동시에 인증해도 고유번호가 겹치지 않게 한다.
+
+
 class VerifyModal(discord.ui.Modal, title="서버 인증"):
-    number = discord.ui.TextInput(label="고유번호", placeholder="예: 3498", max_length=10)
-    roblox = discord.ui.TextInput(label="로블록스 닉네임", placeholder="예: runmingi848", max_length=32)
+    code = discord.ui.TextInput(
+        label="인증 코드",
+        placeholder="인증 맵에 표시된 코드를 입력하세요",
+        min_length=4,
+        max_length=12,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
-        user_id = str(interaction.user.id)
-        number = self.number.value.strip()
-        roblox = self.roblox.value.strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        code = self.code.value.strip().upper()
 
-        if db_get(user_id):
-            await interaction.response.send_message("❌ 이미 인증된 계정입니다.", ephemeral=True)
-            return
-        if db_get_number(number):
-            await interaction.response.send_message("❌ 이미 사용 중인 고유번호입니다.", ephemeral=True)
+        pending = get_pending(code)
+        if pending is None:
+            await interaction.followup.send(
+                "❌ 코드가 올바르지 않거나 만료되었습니다.\n"
+                "인증 맵에 다시 접속해서 새 코드를 확인해주세요.",
+                ephemeral=True,
+            )
             return
 
-        ok, result = await apply_auth(interaction.user, number, roblox)
+        roblox = pending["roblox"]
+        if db_get_roblox(roblox):
+            await interaction.followup.send(
+                "❌ 이미 다른 디스코드 계정에 연결된 로블록스 계정입니다.", ephemeral=True
+            )
+            return
+
+        async with REGISTER_LOCK:
+            number = next_serial()
+            ok, result = await register_member(interaction.user, number, roblox)
+
         if not ok:
-            await interaction.response.send_message(result, ephemeral=True)
+            await interaction.followup.send(result, ephemeral=True)
             return
 
-        created = now().strftime("%Y-%m-%d %H:%M:%S")
-        db.execute(
-            "INSERT INTO users(discord_id, number, roblox, created) VALUES (?, ?, ?, ?)",
-            (user_id, number, roblox, created),
-        )
-        db.commit()
-        save_json(user_id, number, roblox)
+        discard_code(code)
 
-        await interaction.response.send_message(
-            f"✅ 인증 완료!\n닉네임: `{result}`", ephemeral=True
+        nick_text = (
+            f"닉네임: `{result}`" if result else "닉네임은 변경할 수 없어 그대로 두었습니다."
+        )
+        await interaction.followup.send(
+            f"✅ 인증 완료!\n고유번호: `{number}`\n로블록스: `{roblox}`\n{nick_text}",
+            ephemeral=True,
         )
         await send_log(
             "🔐 인증 완료",
@@ -641,25 +372,19 @@ class UserSelect(discord.ui.UserSelect):
         member = self.values[0]
         data = db_get(member.id)
 
-        if self.mode == "search":
-            if not data:
-                await interaction.response.send_message("❌ 인증 정보가 없습니다.", ephemeral=True)
-                return
-            embed = discord.Embed(title="🔎 인증 정보", color=0x3498DB)
-            embed.add_field(name="유저", value=member.mention)
-            embed.add_field(name="고유번호", value=data[1])
-            embed.add_field(name="로블록스", value=data[2])
-            embed.add_field(name="인증일", value=data[3], inline=False)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
         if not data:
-            await interaction.response.send_message("❌ 해당 유저의 인증 정보가 없습니다.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ 해당 유저의 인증 정보가 없습니다.", ephemeral=True
+            )
             return
 
-        db.execute("DELETE FROM users WHERE discord_id=?", (str(member.id),))
-        db.commit()
-        delete_json(member.id)
+        if self.mode == "search":
+            await interaction.response.send_message(
+                embed=auth_info_embed(member, data), ephemeral=True
+            )
+            return
+
+        delete_user(member.id)
         await remove_auth(member)
         await interaction.response.send_message(
             f"🗑️ {member.mention} 인증 정보 삭제 완료\n✅ 역할 제거\n✅ 닉네임 초기화",
@@ -695,6 +420,251 @@ class AdminMenu(discord.ui.View):
 
 
 # =========================
+# 티켓 시스템
+# =========================
+def is_ticket_staff(member: discord.Member) -> bool:
+    perms = member.guild_permissions
+    if perms.administrator or perms.manage_channels:
+        return True
+    return bool(
+        TICKET_STAFF_ROLE_ID
+        and any(role.id == TICKET_STAFF_ROLE_ID for role in member.roles)
+    )
+
+
+def get_ticket_owner_id(channel: discord.TextChannel):
+    match = re.search(r"(?:^|\|)ticket-owner:(\d+)(?:\||$)", channel.topic or "")
+    return int(match.group(1)) if match else None
+
+
+async def make_ticket_transcript(channel: discord.TextChannel) -> bytes:
+    lines = [
+        f"티켓 채널: #{channel.name}",
+        f"채널 ID: {channel.id}",
+        f"생성 시각(UTC): {channel.created_at.isoformat()}",
+        "=" * 70,
+    ]
+    async for message in channel.history(limit=None, oldest_first=True):
+        timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        content = message.content or ""
+        if message.attachments:
+            attachments = " | ".join(a.url for a in message.attachments)
+            content = f"{content}\n[첨부파일] {attachments}".strip()
+        if message.embeds:
+            embed_text = " | ".join(
+                f"Embed: {e.title or ''} {e.description or ''}".strip()
+                for e in message.embeds
+            )
+            content = f"{content}\n[{embed_text}]".strip()
+        lines.append(f"[{timestamp}] {message.author} ({message.author.id}): {content}")
+    return "\n".join(lines).encode("utf-8", errors="replace")
+
+
+class TicketCreateModal(discord.ui.Modal, title="문의 티켓 생성"):
+    subject = discord.ui.TextInput(
+        label="문의 제목",
+        placeholder="예: 인증이 되지 않아요",
+        min_length=2,
+        max_length=100,
+    )
+    details = discord.ui.TextInput(
+        label="문의 내용",
+        placeholder="문제 상황을 자세히 적어주세요.",
+        style=discord.TextStyle.paragraph,
+        min_length=5,
+        max_length=1500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "❌ 서버 안에서만 티켓을 만들 수 있습니다.", ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+        member = interaction.user
+
+        for channel in guild.text_channels:
+            if get_ticket_owner_id(channel) == member.id:
+                await interaction.response.send_message(
+                    f"이미 열린 티켓이 있습니다: {channel.mention}", ephemeral=True
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        member_perms = dict(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        )
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(**member_perms),
+        }
+        if guild.me:
+            overwrites[guild.me] = discord.PermissionOverwrite(
+                **member_perms, manage_channels=True, manage_messages=True
+            )
+
+        staff_role = guild.get_role(TICKET_STAFF_ROLE_ID) if TICKET_STAFF_ROLE_ID else None
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(
+                **member_perms, manage_messages=True
+            )
+
+        category = guild.get_channel(TICKET_CATEGORY_ID) if TICKET_CATEGORY_ID else None
+        if not isinstance(category, discord.CategoryChannel):
+            category = None
+
+        safe_name = re.sub(r"[^a-z0-9가-힣-]", "-", member.name.lower())
+        safe_name = re.sub(r"-+", "-", safe_name).strip("-")[:35] or "user"
+
+        try:
+            channel = await guild.create_text_channel(
+                name=f"ticket-{safe_name}",
+                category=category,
+                overwrites=overwrites,
+                topic=f"ticket-owner:{member.id}|subject:{self.subject.value[:100]}",
+                reason=f"티켓 생성: {member} ({member.id})",
+            )
+            embed = discord.Embed(
+                title="🎫 문의 티켓",
+                description=(
+                    f"**문의자:** {member.mention}\n"
+                    f"**제목:** {self.subject.value}\n\n"
+                    f"**문의 내용**\n{self.details.value}"
+                ),
+                color=0x5865F2,
+                timestamp=now(),
+            )
+            embed.set_footer(text=f"문의자 ID: {member.id}")
+            await channel.send(
+                content=member.mention + (f" {staff_role.mention}" if staff_role else ""),
+                embed=embed,
+                view=TicketCloseView(),
+                allowed_mentions=discord.AllowedMentions(
+                    users=True, roles=bool(staff_role), everyone=False
+                ),
+            )
+            await interaction.followup.send(
+                f"✅ 티켓이 생성되었습니다: {channel.mention}", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ 티켓 채널을 만들 권한이 없습니다. 봇에 채널 관리 권한을 부여해주세요.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            print(f"❌ 티켓 생성 실패: {e}")
+            await interaction.followup.send(
+                "❌ 티켓 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+                ephemeral=True,
+            )
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="🎫 문의하기",
+        style=discord.ButtonStyle.primary,
+        custom_id="ticket_open_button",
+    )
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "서버 안에서만 사용할 수 있습니다.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(TicketCreateModal())
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="🔒 티켓 닫기",
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket_close_button",
+    )
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        guild = interaction.guild
+        if not isinstance(channel, discord.TextChannel) or not guild:
+            await interaction.response.send_message(
+                "❌ 티켓 채널에서만 사용할 수 있습니다.", ephemeral=True
+            )
+            return
+
+        owner_id = get_ticket_owner_id(channel)
+        if owner_id is None:
+            await interaction.response.send_message(
+                "❌ 이 채널은 티켓 채널로 확인되지 않습니다.", ephemeral=True
+            )
+            return
+
+        is_owner = interaction.user.id == owner_id
+        is_staff = isinstance(interaction.user, discord.Member) and is_ticket_staff(interaction.user)
+        if not is_owner and not is_staff:
+            await interaction.response.send_message(
+                "❌ 티켓 작성자 또는 운영진만 티켓을 닫을 수 있습니다.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        log_channel = guild.get_channel(TICKET_LOG_CHANNEL_ID)
+        try:
+            transcript = await make_ticket_transcript(channel)
+            if isinstance(log_channel, discord.TextChannel):
+                embed = discord.Embed(
+                    title="🔒 티켓 종료",
+                    description=(
+                        f"**채널:** #{channel.name}\n"
+                        f"**종료자:** {interaction.user.mention}\n"
+                        f"**문의자:** <@{owner_id}>"
+                    ),
+                    color=0xE74C3C,
+                    timestamp=now(),
+                )
+                await log_channel.send(
+                    embed=embed,
+                    file=discord.File(
+                        io.BytesIO(transcript),
+                        filename=f"ticket-{channel.id}-transcript.txt",
+                    ),
+                )
+            else:
+                print(
+                    f"⚠️ 티켓 로그 채널({TICKET_LOG_CHANNEL_ID})을 찾을 수 없어 "
+                    "대화 기록을 저장하지 못했습니다."
+                )
+
+            await interaction.followup.send(
+                "🔒 티켓을 닫았습니다. 대화 기록을 저장한 뒤 채널을 삭제합니다.",
+                ephemeral=True,
+            )
+            await asyncio.sleep(3)
+            await channel.delete(reason=f"티켓 종료: {interaction.user} ({interaction.user.id})")
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ 기록 저장 또는 채널 삭제 권한이 없습니다. 봇 권한을 확인해주세요.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            print(f"❌ 티켓 종료 처리 실패: {e}")
+            await interaction.followup.send(
+                "❌ 티켓 종료 처리 중 오류가 발생했습니다. 콘솔 로그를 확인해주세요.",
+                ephemeral=True,
+            )
+
+
+# =========================
 # 상태 표시
 # =========================
 async def update_status():
@@ -704,11 +674,12 @@ async def update_status():
             guild = bot.get_guild(GUILD_ID)
             channel = bot.get_channel(STATUS_CHANNEL_ID)
             if guild and channel:
-                counts = {discord.Status.online: 0, discord.Status.idle: 0, discord.Status.dnd: 0}
-                for member in guild.members:
-                    if member.status in counts:
-                        counts[member.status] += 1
-                name = f"🟢 {counts[discord.Status.online]}  🌙 {counts[discord.Status.idle]}  ⛔ {counts[discord.Status.dnd]}"
+                counts = Counter(m.status for m in guild.members)
+                name = (
+                    f"🟢 {counts[discord.Status.online]}  "
+                    f"🌙 {counts[discord.Status.idle]}  "
+                    f"⛔ {counts[discord.Status.dnd]}"
+                )
                 if channel.name != name:
                     try:
                         await channel.edit(name=name, reason="서버 상태 자동 갱신")
@@ -728,108 +699,26 @@ async def update_status():
 async def on_message(message):
     if message.author.bot:
         return
-
     cache_message(message)
-
-    # 지정된 자동 문의 채널에서만 Gemini가 답변한다.
-    if (
-        AI_QA_ENABLED
-        and message.guild
-        and message.channel.id == AI_QA_CHANNEL_ID
-        and message.content.strip()
-    ):
-        print(f"🤖 Gemini 자동 문의: {message.content[:100]!r}")
-        answer = await gemini_answer_question(message.content)
-        try:
-            await message.reply(answer, mention_author=False)
-        except discord.HTTPException as e:
-            print(f"❌ 자동 문의 답변 전송 실패: {e}")
-        return
-
-    if PROFANITY_FILTER_ENABLED and message.guild and message.content:
-        # 1) 확실한 욕설/초성은 즉시 삭제
-        matched = find_local_profanity(message.content)
-        if matched:
-            BOT_DELETED_MESSAGES.add(message.id)
-            try:
-                await message.delete()
-                await send_filter_log(message, f"즉시 필터: {matched}")
-            except discord.Forbidden:
-                BOT_DELETED_MESSAGES.discard(message.id)
-                print("메시지 삭제 권한이 없습니다.")
-            except discord.HTTPException as e:
-                BOT_DELETED_MESSAGES.discard(message.id)
-                print(f"메시지 삭제 실패: {e}")
-            return
-
-        # 2) 의심되는 메시지만 Gemini가 문맥 판단
-        # 일반적인 메시지는 Gemini로 보내지 않고 바로 통과시킨다.
-        if GEMINI_ENABLED and message.content.strip() and should_gemini_review(message.content):
-            print(f"🤖 Gemini 검열 요청: {message.content[:100]!r}")
-
-            ai_delete, reason = await gemini_moderate(message.content)
-
-            if reason.startswith("Gemini 일시 오류") or reason.startswith("Gemini 오류"):
-                print(f"⚠️ Gemini 검열 최종 실패: {reason}")
-            else:
-                print(
-                    f"🤖 Gemini 판정: "
-                    f"{'DELETE' if ai_delete else 'ALLOW'} | {reason}"
-                )
-
-            if ai_delete:
-                BOT_DELETED_MESSAGES.add(message.id)
-                try:
-                    await message.delete()
-                    await send_filter_log(message, "Gemini AI", reason)
-                except discord.Forbidden:
-                    BOT_DELETED_MESSAGES.discard(message.id)
-                    print("메시지 삭제 권한이 없습니다.")
-                except discord.HTTPException as e:
-                    BOT_DELETED_MESSAGES.discard(message.id)
-                    print(f"메시지 삭제 실패: {e}")
-                return
-
     await bot.process_commands(message)
+
 
 @bot.event
 async def on_message_delete(message):
-    cached = MESSAGE_CACHE.pop(message.id, None)
-    if message.id in BOT_DELETED_MESSAGES:
-        BOT_DELETED_MESSAGES.discard(message.id)
-        return
+    content = MESSAGE_CACHE.pop(message.id, None)
     if message.guild and not message.author.bot:
         deleter = await find_delete_actor(message)
-        await send_message_delete_log(message, deleter=deleter, content_override=(cached or {}).get("content"))
+        await send_message_delete_log(message, deleter, content or message.content)
 
 
 @bot.event
 async def on_ready():
     global status_task, views_registered, commands_synced
     print(f"{bot.user} 로그인 완료!")
-    guild = bot.get_guild(GUILD_ID)
-    if guild and guild.me:
-        perms = guild.me.guild_permissions
-        print(f"🛡️ 욕설 검열: {'ON' if PROFANITY_FILTER_ENABLED else 'OFF'} | 메시지 관리 권한: {'OK' if perms.manage_messages else '없음'}")
-        print(f"🤖 Gemini 문맥 검열: {'ON' if GEMINI_ENABLED else 'OFF'} | 모델: {GEMINI_MODEL}")
-        print(
-            f"💬 Gemini 자동 문의: {'ON' if AI_QA_ENABLED else 'OFF'}"
-            + (f" | 채널 ID: {AI_QA_CHANNEL_ID}" if AI_QA_ENABLED else "")
-        )
-        print(
-            f"🍌 Nano Banana 이미지: {'ON' if NANO_BANANA_ENABLED else 'OFF'} | 모델: {NANO_BANANA_MODEL}"
-        )
-        if not GEMINI_ENABLED:
-            if genai is None:
-                print("⚠️ google-genai 패키지가 없습니다. 설치: python -m pip install -U google-genai")
-            elif not GEMINI_API_KEY:
-                print("⚠️ .env의 GEMINI_API_KEY를 읽지 못했습니다.")
-        if not perms.manage_messages:
-            print("⚠️ 봇에게 '메시지 관리' 권한이 없습니다. 욕설 메시지를 삭제할 수 없습니다.")
 
     if not views_registered:
-        bot.add_view(VerifyButton())
-        bot.add_view(AdminMenu())
+        for view in (VerifyButton(), AdminMenu(), TicketPanelView(), TicketCloseView()):
+            bot.add_view(view)
         views_registered = True
 
     if not commands_synced:
@@ -842,13 +731,39 @@ async def on_ready():
 
 
 # =========================
-# 인증 명령어
+# 슬래시 명령어: 인증 / 티켓
 # =========================
+@bot.tree.command(name="티켓설정", description="문의 티켓 패널을 생성합니다.", guild=GUILD)
+async def ticket_setup(interaction: discord.Interaction):
+    if await deny_non_admin(interaction):
+        return
+    embed = discord.Embed(
+        title="🎫 고객센터",
+        description=(
+            "문의가 필요하면 아래 **문의하기** 버튼을 눌러주세요.\n"
+            "문의 제목과 내용을 작성하면 운영진만 볼 수 있는 비공개 티켓이 생성됩니다.\n\n"
+            "• 한 번에 열린 티켓은 1개만 만들 수 있습니다.\n"
+            "• 문의가 끝나면 티켓 닫기를 눌러주세요.\n"
+            "• 종료된 티켓 대화 기록은 로그 채널에 저장됩니다."
+        ),
+        color=0x5865F2,
+    )
+    await interaction.response.send_message(embed=embed, view=TicketPanelView())
+
+
 @bot.tree.command(name="인증설정", description="인증 버튼 생성", guild=GUILD)
 async def verify_setup(interaction: discord.Interaction):
+    if await deny_non_admin(interaction):
+        return
     embed = discord.Embed(
         title="🔐 서버 인증",
-        description="아래 버튼을 눌러 인증해주세요.\n\n고유번호와 로블록스 닉네임 필요",
+        description=(
+            "**인증 방법**\n"
+            "1. 인증 맵에 접속해서 화면에 표시되는 **인증 코드**를 확인해요.\n"
+            "2. 아래 버튼을 누르고 코드를 입력해요.\n"
+            "3. 닉네임 변경과 역할 지급이 자동으로 진행돼요.\n\n"
+            "고유번호는 자동으로 배정돼요."
+        ),
         color=0x00FF00,
     )
     await interaction.response.send_message(embed=embed, view=VerifyButton())
@@ -872,28 +787,14 @@ async def manual_verify(interaction: discord.Interaction, member: discord.Member
         return
 
     number, roblox = number.strip(), roblox.strip()
-    if db_get(member.id):
-        await interaction.response.send_message("❌ 이미 인증된 유저입니다.", ephemeral=True)
-        return
-    if db_get_number(number):
-        await interaction.response.send_message("❌ 이미 사용 중인 고유번호입니다.", ephemeral=True)
-        return
-
-    ok, result = await apply_auth(member, number, roblox)
+    ok, result = await register_member(member, number, roblox)
     if not ok:
         await interaction.response.send_message(result, ephemeral=True)
         return
 
-    created = now().strftime("%Y-%m-%d %H:%M:%S")
-    db.execute(
-        "INSERT INTO users(discord_id, number, roblox, created) VALUES (?, ?, ?, ?)",
-        (str(member.id), number, roblox, created),
-    )
-    db.commit()
-    save_json(member.id, number, roblox)
-
+    nick_text = "" if result else "\n※ 닉네임은 변경할 수 없어 그대로 두었습니다."
     await interaction.response.send_message(
-        f"✅ 수동 인증 완료\n대상: {member.mention}\n고유번호: `{number}`\n로블록스: `{roblox}`",
+        f"✅ 수동 인증 완료\n대상: {member.mention}\n고유번호: `{number}`\n로블록스: `{roblox}`{nick_text}",
         ephemeral=True,
     )
     await send_log(
@@ -912,13 +813,7 @@ async def verify_search(interaction: discord.Interaction, member: discord.Member
     if not data:
         await interaction.response.send_message("❌ 해당 유저의 인증 정보가 없습니다.", ephemeral=True)
         return
-
-    embed = discord.Embed(title="🔎 인증 정보", color=0x3498DB)
-    embed.add_field(name="유저", value=member.mention, inline=False)
-    embed.add_field(name="고유번호", value=data[1])
-    embed.add_field(name="로블록스", value=data[2])
-    embed.add_field(name="인증일", value=data[3], inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=auth_info_embed(member, data), ephemeral=True)
 
 
 @bot.tree.command(name="인증삭제", description="인증 정보 삭제", guild=GUILD)
@@ -930,9 +825,7 @@ async def verify_delete(interaction: discord.Interaction, member: discord.Member
         await interaction.response.send_message("❌ 인증 정보가 없습니다.", ephemeral=True)
         return
 
-    db.execute("DELETE FROM users WHERE discord_id=?", (str(member.id),))
-    db.commit()
-    delete_json(member.id)
+    delete_user(member.id)
     await remove_auth(member)
 
     await interaction.response.send_message("🗑️ 인증 삭제 완료", ephemeral=True)
@@ -943,152 +836,6 @@ async def verify_delete(interaction: discord.Interaction, member: discord.Member
          ("처리자", interaction.user.mention, False)],
         0xFF0000, True,
     )
-
-
-# =========================
-# 서버정보 관리
-# =========================
-@bot.tree.command(name="서버정보등록", description="Gemini 자동문의에 사용할 서버정보를 등록/수정합니다.", guild=GUILD)
-async def server_info_register(interaction: discord.Interaction, 항목: str, 내용: str):
-    if await deny_non_admin(interaction):
-        return
-
-    항목 = 항목.strip()[:50]
-    내용 = 내용.strip()[:1000]
-    if not 항목 or not 내용:
-        await interaction.response.send_message("❌ 항목과 내용을 모두 입력해주세요.", ephemeral=True)
-        return
-
-    data = load_server_info()
-    data[항목] = 내용
-    save_server_info(data)
-
-    await interaction.response.send_message(
-        f"✅ 서버정보 등록 완료\n`{항목}` → `{내용}`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="서버정보삭제", description="등록된 서버정보 항목을 삭제합니다.", guild=GUILD)
-async def server_info_delete(interaction: discord.Interaction, 항목: str):
-    if await deny_non_admin(interaction):
-        return
-
-    항목 = 항목.strip()
-    data = load_server_info()
-    if 항목 not in data:
-        await interaction.response.send_message("❌ 해당 항목이 없습니다.", ephemeral=True)
-        return
-
-    old = data.pop(항목)
-    save_server_info(data)
-    await interaction.response.send_message(
-        f"🗑️ 서버정보 삭제 완료\n`{항목}` → `{old}`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="서버정보보기", description="현재 등록된 서버정보를 확인합니다.", guild=GUILD)
-async def server_info_view(interaction: discord.Interaction):
-    if await deny_non_admin(interaction):
-        return
-
-    data = load_server_info()
-    if not data:
-        await interaction.response.send_message("📭 등록된 서버정보가 없습니다.", ephemeral=True)
-        return
-
-    text = "\n".join(f"**{key}**: {value}" for key, value in data.items())
-    embed = discord.Embed(title="📚 등록된 서버정보", description=text[:4000], color=0x5865F2)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# =========================
-# Nano Banana 이미지 생성
-# =========================
-@bot.tree.command(
-    name="그림",
-    description="Nano Banana로 이미지를 생성합니다.",
-    guild=GUILD,
-)
-async def generate_image(interaction: discord.Interaction, 프롬프트: str):
-    if not NANO_BANANA_ENABLED:
-        await interaction.response.send_message(
-            "❌ Nano Banana가 연결되어 있지 않습니다.",
-            ephemeral=True,
-        )
-        return
-
-    prompt = 프롬프트.strip()
-    if not prompt:
-        await interaction.response.send_message(
-            "❌ 그림 설명을 입력해주세요.",
-            ephemeral=True,
-        )
-        return
-
-    if len(prompt) > NANO_BANANA_MAX_PROMPT:
-        await interaction.response.send_message(
-            f"❌ 프롬프트는 {NANO_BANANA_MAX_PROMPT}자 이하로 입력해주세요.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer()
-    print(f"🍌 Nano Banana 이미지 생성 요청: {prompt[:100]!r}")
-
-    try:
-        async with gemini_semaphore:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    gemini_client.interactions.create,
-                    model=NANO_BANANA_MODEL,
-                    input=prompt,
-                    response_format={
-                        "type": "image",
-                        "mime_type": "image/jpeg",
-                        "aspect_ratio": "1:1",
-                        "image_size": "1K",
-                    },
-                ),
-                timeout=90,
-            )
-
-        output_image = getattr(result, "output_image", None)
-        image_data = getattr(output_image, "data", None) if output_image else None
-
-        if not image_data:
-            await interaction.followup.send(
-                "❌ 이미지 생성 결과를 받지 못했습니다. 잠시 후 다시 시도해주세요."
-            )
-            return
-
-        image_bytes = base64.b64decode(image_data)
-        file = discord.File(
-            io.BytesIO(image_bytes),
-            filename="nano_banana.jpg",
-        )
-
-        embed = discord.Embed(
-            title="🍌 Nano Banana 이미지",
-            description=f"**프롬프트:** {prompt[:1000]}",
-            color=0x5865F2,
-        )
-        embed.set_image(url="attachment://nano_banana.jpg")
-        embed.set_footer(text=f"모델: {NANO_BANANA_MODEL}")
-
-        await interaction.followup.send(embed=embed, file=file)
-        print("🍌 Nano Banana 이미지 생성 완료")
-
-    except Exception as e:
-        print(
-            f"❌ Nano Banana 이미지 생성 오류: "
-            f"{type(e).__name__}: {e}"
-        )
-        await interaction.followup.send(
-            "❌ 이미지 생성에 실패했습니다. "
-            "콘솔의 `Nano Banana 이미지 생성 오류` 로그를 확인해주세요."
-        )
 
 
 # =========================
@@ -1113,40 +860,63 @@ REGION_ALIASES = {
 }
 
 
-def fetch_json(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "DiscordWeatherBot/1.0"})
-    with urllib.request.urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+async def fetch_json(session, url, params):
+    async with session.get(url, params=params) as response:
+        response.raise_for_status()
+        return await response.json()
 
 
 @bot.tree.command(name="날씨", description="원하는 지역의 현재 날씨를 확인합니다.", guild=GUILD)
 async def weather(interaction: discord.Interaction, 지역: str):
-    await interaction.response.defer()
     region = 지역.strip()
     if not region:
-        await interaction.followup.send("❌ 지역을 입력해주세요. 예: `/날씨 전주`")
+        await interaction.response.send_message(
+            "❌ 지역을 입력해주세요. 예: `/날씨 전주`", ephemeral=True
+        )
         return
 
-    try:
-        query = urllib.parse.quote(REGION_ALIASES.get(region, region))
-        geo_url = (
-            "https://geocoding-api.open-meteo.com/v1/search"
-            f"?name={query}&count=5&language=en&format=json&countryCode=KR"
-        )
-        results = (await asyncio.to_thread(fetch_json, geo_url)).get("results", [])
-        if not results:
-            await interaction.followup.send(f"❌ **{region}** 지역을 찾지 못했어.\n예: `/날씨 전주` 또는 `/날씨 서울`")
-            return
+    await interaction.response.defer()
 
-        place = next((x for x in results if x.get("country_code") == "KR"), results[0])
-        lat, lon = place["latitude"], place["longitude"]
-        weather_url = (
-            "https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
-            "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,precipitation"
-            "&temperature_unit=celsius&wind_speed_unit=kmh&timezone=auto"
-        )
-        current = (await asyncio.to_thread(fetch_json, weather_url)).get("current", {})
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        headers = {"User-Agent": "DiscordWeatherBot/1.0"}
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            geo = await fetch_json(
+                session,
+                "https://geocoding-api.open-meteo.com/v1/search",
+                {
+                    "name": REGION_ALIASES.get(region, region),
+                    "count": 5,
+                    "language": "en",
+                    "format": "json",
+                    "countryCode": "KR",
+                },
+            )
+            results = geo.get("results", [])
+            if not results:
+                await interaction.followup.send(
+                    f"❌ **{region}** 지역을 찾지 못했어.\n예: `/날씨 전주` 또는 `/날씨 서울`"
+                )
+                return
+
+            place = next((x for x in results if x.get("country_code") == "KR"), results[0])
+            data = await fetch_json(
+                session,
+                "https://api.open-meteo.com/v1/forecast",
+                {
+                    "latitude": place["latitude"],
+                    "longitude": place["longitude"],
+                    "current": (
+                        "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                        "weather_code,wind_speed_10m,precipitation"
+                    ),
+                    "temperature_unit": "celsius",
+                    "wind_speed_unit": "kmh",
+                    "timezone": "auto",
+                },
+            )
+
+        current = data.get("current", {})
         icon, condition = WEATHER_CODES.get(int(current.get("weather_code", -1)), ("🌡️", "날씨 정보"))
 
         embed = discord.Embed(
@@ -1166,9 +936,9 @@ async def weather(interaction: discord.Interaction, 지역: str):
         embed.set_footer(text="Open-Meteo 날씨 데이터")
         await interaction.followup.send(embed=embed)
 
-    except urllib.error.HTTPError as e:
-        await interaction.followup.send(f"❌ 날씨 서버 요청에 실패했어. (`HTTP {e.code}`)")
-    except (urllib.error.URLError, TimeoutError) as e:
+    except aiohttp.ClientResponseError as e:
+        await interaction.followup.send(f"❌ 날씨 서버 요청에 실패했어. (`HTTP {e.status}`)")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         await interaction.followup.send(f"❌ 날씨 서버에 연결하지 못했어.\n```{type(e).__name__}: {e}```")
     except Exception as e:
         await interaction.followup.send(f"❌ 날씨 조회에 실패했어.\n```{type(e).__name__}: {e}```")
@@ -1184,8 +954,10 @@ def start_api():
         print(f"FastAPI 시작 실패 (포트 {PORT}): {e}")
 
 
-threading.Thread(target=start_api, daemon=True).start()
-bot.run(TOKEN)
+if __name__ == "__main__":
+    threading.Thread(target=start_api, daemon=True).start()
+    bot.run(TOKEN)
+
 
 
 threading.Thread(target=start_api, daemon=True).start()
