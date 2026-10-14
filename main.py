@@ -944,6 +944,7 @@ async def weather(interaction: discord.Interaction, 지역: str):
         await interaction.followup.send(f"❌ 날씨 조회에 실패했어.\n```{type(e).__name__}: {e}```")
 
 
+
 # =========================
 # FastAPI + 봇 실행
 # =========================
@@ -957,10 +958,5 @@ def start_api():
 if __name__ == "__main__":
     threading.Thread(target=start_api, daemon=True).start()
     bot.run(TOKEN)
-
-
-
-threading.Thread(target=start_api, daemon=True).start()
-bot.run(TOKEN)
 
 
